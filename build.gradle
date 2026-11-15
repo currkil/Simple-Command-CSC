@@ -1,0 +1,68 @@
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+}
+
+// CSC 是纯 JDK 库：不依赖 Minecraft、不依赖任何加载器。
+// 这样 Core 可以直接 JiJ 内嵌，将来 Paper / 脚本终端也能复用同一份实现。
+group = csc_group_id
+version = csc_version
+
+base {
+    archivesName = 'sc_csc'
+}
+
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(17)
+    withSourcesJar()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+jar {
+    manifest {
+        attributes(
+                'Implementation-Title': 'Simple Command CSC',
+                'Implementation-Version': project.version,
+                'Implementation-Vendor': 'currkill'
+        )
+    }
+}
+
+// 语言层冒烟测试：tools/ 下的纯 JDK 测试程序，不引入测试框架。
+sourceSets {
+    smoke {
+        java.srcDir 'tools'
+        compileClasspath += sourceSets.main.output
+        runtimeClasspath += sourceSets.main.output
+    }
+}
+
+configurations {
+    smokeImplementation.extendsFrom implementation
+}
+
+tasks.register('smokeTest', JavaExec) {
+    group = 'verification'
+    description = '运行 CSC 语言层冒烟测试'
+    classpath = sourceSets.smoke.runtimeClasspath
+    mainClass = 'SmokeTest'
+    jvmArgs '-Dfile.encoding=UTF-8'
+}
+
+tasks.named('check') {
+    dependsOn 'smokeTest'
+}
+
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            from components.java
+            groupId = "${csc_group_id}" as Publication
+            artifactId = 'sc_csc' as Publication
+            version = "${csc_version}" as Publication
+        }
+    }
+}
