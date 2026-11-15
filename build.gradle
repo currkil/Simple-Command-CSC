@@ -56,13 +56,21 @@ tasks.named('check') {
     dependsOn 'smokeTest'
 }
 
+def repoToken = project.findProperty("reposiliteToken") ?: ""
 publishing {
     publications {
         mavenJava(MavenPublication) {
             from components.java
-            groupId = "${csc_group_id}" as Publication
-            artifactId = 'sc_csc' as Publication
-            version = "${csc_version}" as Publication
+        }
+    }
+    repositories {
+        maven {
+            url = "http://192.168.1.4:8080/releases"
+            credentials {
+                username = "admin"
+                password = repoToken
+            }
+            allowInsecureProtocol = true
         }
     }
 }
