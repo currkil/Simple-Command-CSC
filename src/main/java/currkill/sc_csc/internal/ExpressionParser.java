@@ -1,159 +1,238 @@
 package currkill.sc_csc.internal;
 
-import currkill.sc_csc.api.Diagnostic;
-import currkill.sc_csc.api.EvaluationException;
-import currkill.sc_csc.api.VariableProvider;
+import currkill.sc_csc.api.CscContext;
+import currkill.sc_csc.api.CscDiagnostic;
+import currkill.sc_csc.api.CscRuntimeException;
+import currkill.sc_csc.api.CscSyntaxException;
+import currkill.sc_csc.api.CscType;
+import currkill.sc_csc.api.CscValue;
 
 import java.util.List;
-import java.util.Optional;
 
 /**
- * 表达式解析 + 求值（单遍递归下降）。
+ * 表达式解析与求值（单遍递归下降，边解析边算）。
  *
- * <p>运算符优先级由低到高：{@code ||}、{@code ^}、{@code &&}、{@code + -}、
- * {@code * / /@}、一元 {@code + -}、{@code **}、基本项。
+ * <p>优先级由低到高：{@code ^}、{@code ||}、{@code &&}、{@code == !=}、
+ * {@code < <= > >=}、{@code + -}、{@code * / %mod}、一元 {@code + - !}、
+ * {@code **}（右结合）、基本项与下标。
  *
- * <p>{@code **} 右结合，且比一元负号紧，因此 {@code -2**2 == -4}（与 Python 一致）。
- * {@code /@} 是取余。
+ * <p>{@code %mod} 与 {@code %变量%} 按上下文区分：在“该出现运算符”的位置遇到
+ * {@code %mod} 且后面不是 {@code %}，就是取模；在“该出现操作数”的位置遇到 {@code %}
+ * 就按变量配对到下一个 {@code %}。
  *
- * <p>求值器无副作用、可重入、不依赖 Minecraft 类型；变量只通过 {@link VariableProvider} 读取。
- * {@code &&} / {@code ||} 不做短路求值（语言层是纯求值，两侧都会算完），这一点写在 LANGUAGE.md。
+ * <p>不求值副作用、不做 IO；转换记录通过 {@link CscContext#report} 交回宿主。
  */
 public final class ExpressionParser {
 
     private final String src;
+    private final CscContext ctx;
     private final int baseOffset;
-    private final VariableProvider vars;
-    private final List<Diagnostic> diagnostics;
     private int pos;
 
-    public ExpressionParser(String source, VariableProvider vars, List<Diagnostic> diagnostics, int baseOffset) {
-        this.src = source;
-        this.vars = vars == null ? VariableProvider.empty() : vars;
-        this.diagnostics = diagnostics;
+    public ExpressionParser(String source, CscContext ctx, int baseOffset) {
+        this.src = source == null ? "" : source;
+        this.ctx = ctx;
         this.baseOffset = baseOffset;
     }
 
-    public Value parse() {
-        if (src.isBlank()) {
-            throw error("表达式为空");
+    /** 求值整段表达式文本。 */
+    public static CscValue parseFull(String source, CscContext ctx, int baseOffset) {
+        return new ExpressionParser(source, ctx, baseOffset).parse();
+    }
+
+    public CscValue parse() {
+        skipWhitespace();
+        if (pos >= src.length()) {
+            throw new CscSyntaxException("表达式为空", baseOffset);
         }
-        Value value = parseOr();
+        CscValue value = parseOr();
         skipWhitespace();
         if (pos < src.length()) {
-            throw error("表达式中多出无法识别的内容：" + src.substring(pos));
+            throw new CscSyntaxException("表达式里多出无法识别的内容：" + src.substring(pos), absolute());
         }
         return value;
     }
 
-    // ---------------------------------------------------------------- 语法层
+    // ---------------------------------------------------------------- 优先级层
 
-    private Value parseOr() {
-        Value left = parseXor();
+    private CscValue parseOr() {
+        CscValue left = parseXor();
         while (true) {
             skipWhitespace();
             if (!consume("||")) {
                 return left;
             }
-            Value right = parseXor();
-            left = Value.bool(asBoolean(left, "||") || asBoolean(right, "||"));
+            boolean l = Conversions.asBool(left, ctx, absolute(), "||");
+            boolean r = Conversions.asBool(parseXor(), ctx, absolute(), "||");
+            left = CscValue.ofBool(l || r);
         }
     }
 
-    private Value parseXor() {
-        Value left = parseAnd();
+    private CscValue parseXor() {
+        CscValue left = parseAnd();
         while (true) {
             skipWhitespace();
             if (!consume("^")) {
                 return left;
             }
-            Value right = parseAnd();
-            left = Value.bool(asBoolean(left, "^") ^ asBoolean(right, "^"));
+            long l = Conversions.asInt(left, ctx, absolute(), "^");
+            long r = Conversions.asInt(parseAnd(), ctx, absolute(), "^");
+            left = CscValue.ofInt(l ^ r);
         }
     }
 
-    private Value parseAnd() {
-        Value left = parseAdditive();
+    private CscValue parseAnd() {
+        CscValue left = parseEquality();
         while (true) {
             skipWhitespace();
             if (!consume("&&")) {
                 return left;
             }
-            Value right = parseAdditive();
-            left = Value.bool(asBoolean(left, "&&") && asBoolean(right, "&&"));
+            boolean l = Conversions.asBool(left, ctx, absolute(), "&&");
+            boolean r = Conversions.asBool(parseEquality(), ctx, absolute(), "&&");
+            left = CscValue.ofBool(l && r);
         }
     }
 
-    private Value parseAdditive() {
-        Value left = parseMultiplicative();
+    private CscValue parseEquality() {
+        CscValue left = parseComparison();
+        while (true) {
+            skipWhitespace();
+            String op;
+            if (consume("==")) {
+                op = "==";
+            } else if (consume("!=")) {
+                op = "!=";
+            } else {
+                return left;
+            }
+            CscValue right = parseComparison();
+            boolean equal = valuesEqual(left, right);
+            left = CscValue.ofBool("==".equals(op) == equal);
+        }
+    }
+
+    private CscValue parseComparison() {
+        CscValue left = parseAdditive();
+        while (true) {
+            skipWhitespace();
+            String op = null;
+            if (consume("<=")) {
+                op = "<=";
+            } else if (consume(">=")) {
+                op = ">=";
+            } else if (consume("<")) {
+                op = "<";
+            } else if (consume(">")) {
+                op = ">";
+            }
+            if (op == null) {
+                return left;
+            }
+            CscValue right = parseAdditive();
+            int cmp = compare(left, right);
+            left = CscValue.ofBool(switch (op) {
+                case "<=" -> cmp <= 0;
+                case ">=" -> cmp >= 0;
+                case "<" -> cmp < 0;
+                default -> cmp > 0;
+            });
+        }
+    }
+
+    private CscValue parseAdditive() {
+        CscValue left = parseMultiplicative();
         while (true) {
             skipWhitespace();
             if (consume("+")) {
                 left = add(left, parseMultiplicative());
             } else if (consume("-")) {
-                left = Value.number(asNumber(left, "-") - asNumber(parseMultiplicative(), "-"));
+                left = subtract(left, parseMultiplicative());
             } else {
                 return left;
             }
         }
     }
 
-    private Value parseMultiplicative() {
-        Value left = parseUnary();
+    private CscValue parseMultiplicative() {
+        CscValue left = parseUnary();
         while (true) {
             skipWhitespace();
-            if (peek("**")) {
+            if (src.startsWith("**", pos)) {
                 return left;
             }
-            if (consume("/@")) {
-                left = remainder(left, parseUnary());
+            if (tryModKeyword()) {
+                left = modulo(left, parseUnary());
             } else if (consume("/")) {
                 left = divide(left, parseUnary());
             } else if (consume("*")) {
-                left = Value.number(asNumber(left, "*") * asNumber(parseUnary(), "*"));
+                left = multiply(left, parseUnary());
             } else {
                 return left;
             }
         }
     }
 
-    private Value parseUnary() {
+    private CscValue parseUnary() {
         skipWhitespace();
         if (consume("-")) {
-            return Value.number(-asNumber(parseUnary(), "一元 -"));
+            CscValue operand = parseUnary();
+            return Conversions.useFloat(operand, operand)
+                    ? CscValue.ofFloat(-Conversions.asFloat(operand, ctx, absolute(), "一元 -"))
+                    : CscValue.ofInt(-Conversions.asInt(operand, ctx, absolute(), "一元 -"));
         }
         if (consume("+")) {
-            return Value.number(asNumber(parseUnary(), "一元 +"));
+            CscValue operand = parseUnary();
+            return Conversions.useFloat(operand, operand)
+                    ? CscValue.ofFloat(Conversions.asFloat(operand, ctx, absolute(), "一元 +"))
+                    : CscValue.ofInt(Conversions.asInt(operand, ctx, absolute(), "一元 +"));
+        }
+        if (consume("!")) {
+            return CscValue.ofBool(!Conversions.asBool(parseUnary(), ctx, absolute(), "!"));
         }
         return parsePower();
     }
 
-    private Value parsePower() {
-        Value base = parsePrimary();
+    private CscValue parsePower() {
+        CscValue base = parsePrimary();
         skipWhitespace();
-        if (consume("**")) {
-            double exponent = asNumber(parseUnary(), "**");
-            return Value.number(Math.pow(asNumber(base, "**"), exponent));
+        if (!consume("**")) {
+            return base;
         }
-        return base;
+        CscValue exponent = parseUnary();
+        boolean useFloat = Conversions.useFloat(base, exponent);
+        if (!useFloat) {
+            long b = Conversions.asInt(base, ctx, absolute(), "**");
+            long e = Conversions.asInt(exponent, ctx, absolute(), "**");
+            if (e >= 0) {
+                double result = Math.pow(b, e);
+                if (result > Long.MAX_VALUE || result < Long.MIN_VALUE) {
+                    throw new CscRuntimeException("整数幂结果越界");
+                }
+                return CscValue.ofInt((long) result);
+            }
+        }
+        double result = Math.pow(Conversions.asFloat(base, ctx, absolute(), "**"),
+                Conversions.asFloat(exponent, ctx, absolute(), "**"));
+        return CscValue.ofFloat(result);
     }
 
-    private Value parsePrimary() {
+    private CscValue parsePrimary() {
         skipWhitespace();
         if (pos >= src.length()) {
-            throw error("表达式意外结束");
+            throw new CscSyntaxException("表达式意外结束", absolute());
         }
         char c = src.charAt(pos);
         if (c == '(') {
             pos++;
-            Value inner = parseOr();
+            CscValue inner = parseOr();
             skipWhitespace();
             if (!consume(")")) {
-                throw error("缺少右括号 )");
+                throw new CscSyntaxException("缺少右括号 )", absolute());
             }
             return inner;
         }
-        if (c == '\'') {
+        if (c == '"') {
             return parseStringLiteral();
         }
         if (c == '%') {
@@ -162,20 +241,33 @@ public final class ExpressionParser {
         if (Character.isDigit(c) || (c == '.' && pos + 1 < src.length() && Character.isDigit(src.charAt(pos + 1)))) {
             return parseNumberLiteral();
         }
-        if (Character.isLetter(c) || c == '_') {
-            return parseWord();
+        if (Character.isLetter(c)) {
+            int start = pos;
+            while (pos < src.length() && (Character.isLetterOrDigit(src.charAt(pos)) || src.charAt(pos) == '_')) {
+                pos++;
+            }
+            String word = src.substring(start, pos);
+            if ("true".equals(word)) {
+                return CscValue.ofBool(true);
+            }
+            if ("false".equals(word)) {
+                return CscValue.ofBool(false);
+            }
+            throw new CscSyntaxException("未知的标识符：" + word + "（变量请写成 %" + word + "%）", absolute());
         }
-        throw error("无法识别的记号 '" + c + "'");
+        throw new CscSyntaxException("无法识别的记号 '" + c + "'", absolute());
     }
 
-    // ---------------------------------------------------------------- 字面量
+    // ---------------------------------------------------------------- 基本项
 
-    private Value parseNumberLiteral() {
+    private CscValue parseNumberLiteral() {
         int start = pos;
+        boolean isFloat = false;
         while (pos < src.length() && Character.isDigit(src.charAt(pos))) {
             pos++;
         }
         if (pos < src.length() && src.charAt(pos) == '.') {
+            isFloat = true;
             pos++;
             while (pos < src.length() && Character.isDigit(src.charAt(pos))) {
                 pos++;
@@ -188,6 +280,7 @@ public final class ExpressionParser {
                 pos++;
             }
             if (pos < src.length() && Character.isDigit(src.charAt(pos))) {
+                isFloat = true;
                 while (pos < src.length() && Character.isDigit(src.charAt(pos))) {
                     pos++;
                 }
@@ -197,163 +290,234 @@ public final class ExpressionParser {
         }
         String literal = src.substring(start, pos);
         try {
-            return Value.number(Double.parseDouble(literal));
+            return isFloat ? CscValue.ofFloat(Double.parseDouble(literal)) : CscValue.ofInt(Long.parseLong(literal));
         } catch (NumberFormatException e) {
-            throw error("无效的数字：" + literal);
+            throw new CscSyntaxException("无效的数字：" + literal, absolute());
         }
     }
 
-    private Value parseStringLiteral() {
-        pos++; // 跳过开头的 '
+    private CscValue parseStringLiteral() {
+        pos++;
         StringBuilder sb = new StringBuilder();
         while (pos < src.length()) {
             char c = src.charAt(pos);
             if (c == '\\') {
                 if (pos + 1 >= src.length()) {
-                    throw error("字符串中缺少转义字符");
+                    throw new CscSyntaxException("字符串里缺少转义字符", absolute());
                 }
                 char n = src.charAt(pos + 1);
                 switch (n) {
                     case 'n' -> sb.append('\n');
                     case 't' -> sb.append('\t');
                     case 'r' -> sb.append('\r');
-                    case '\\' -> sb.append('\\');
-                    case '\'' -> sb.append('\'');
                     case '"' -> sb.append('"');
+                    case '\\' -> sb.append('\\');
                     case '%' -> sb.append('%');
-                    default -> throw error("字符串中未知的转义序列 \\" + n);
+                    default -> throw new CscSyntaxException("字符串里未知的转义序列 \\" + n, absolute());
                 }
                 pos += 2;
                 continue;
             }
-            if (c == '\'') {
+            if (c == '"') {
                 pos++;
-                return Value.string(sb.toString());
+                return CscValue.ofString(sb.toString());
             }
             sb.append(c);
             pos++;
         }
-        throw error("字符串缺少结尾的单引号 '");
+        throw new CscSyntaxException("字符串缺少结尾的双引号", absolute());
     }
 
-    private Value parseVariable() {
+    private CscValue parseVariable() {
         int start = pos;
-        pos++; // 跳过开头的 %
+        pos++;
         int close = src.indexOf('%', pos);
         if (close < 0) {
-            throw error("变量缺少结尾 %");
+            throw new CscSyntaxException("变量缺少结尾 %", absolute());
         }
-        String name = src.substring(pos, close);
+        String name = src.substring(pos, close).trim();
         pos = close + 1;
         if (name.isEmpty()) {
-            throw error("变量名为空");
+            throw new CscSyntaxException("变量名为空", baseOffset + start);
         }
-        Optional<String> value = vars.get(name);
-        if (value.isEmpty()) {
-            throw new EvaluationException("未知变量 %" + name + "%");
+        if (!ctx.hasVariable(name)) {
+            throw new CscRuntimeException("未知变量 %" + name + "%");
         }
-        // 变量对外一律是字符串；参与运算时按运算符需要再做隐式转换。
-        return Value.string(value.get());
+        CscValue value = ctx.getVariable(name);
+        return parseIndex(value, name);
     }
 
-    private Value parseWord() {
-        int start = pos;
-        while (pos < src.length()) {
-            char c = src.charAt(pos);
-            if (Character.isLetterOrDigit(c) || c == '_') {
-                pos++;
-            } else {
-                break;
+    /** 下标：{@code %list%[i]}，{@code %list%[size]} 返回元素个数。 */
+    private CscValue parseIndex(CscValue value, String name) {
+        skipWhitespace();
+        if (pos >= src.length() || src.charAt(pos) != '[') {
+            return value;
+        }
+        pos++;
+        skipWhitespace();
+        int indexStart = pos;
+        if (src.startsWith("size", pos)) {
+            int after = pos + 4;
+            if (after <= src.length() && (after == src.length() || src.charAt(after) == ']'
+                    || Character.isWhitespace(src.charAt(after)))) {
+                pos = after;
+                skipWhitespace();
+                if (!consume("]")) {
+                    throw new CscSyntaxException("下标缺少右方括号 ]", absolute());
+                }
+                return CscValue.ofInt(value.size() < 0 ? 0 : value.size());
             }
         }
-        String word = src.substring(start, pos);
-        if ("true".equalsIgnoreCase(word)) {
-            return Value.bool(true);
+        long index = Conversions.asInt(parseOr(), ctx, indexStart + baseOffset, "下标");
+        skipWhitespace();
+        if (!consume("]")) {
+            throw new CscSyntaxException("下标缺少右方括号 ]", absolute());
         }
-        if ("false".equalsIgnoreCase(word)) {
-            return Value.bool(false);
+        if (value.type() != CscType.LIST) {
+            throw new CscRuntimeException("%" + name + "% 不是列表，不能下标访问");
         }
-        throw error("未知的标识符：" + word);
+        List<CscValue> list = value.asList();
+        if (index < 0 || index >= list.size()) {
+            throw new CscRuntimeException("下标越界：%" + name + "%[" + index + "]，长度 " + list.size());
+        }
+        return list.get((int) index);
     }
 
     // ---------------------------------------------------------------- 运算
 
-    private Value add(Value left, Value right) {
-        if (left.isString() || right.isString()) {
-            if (!left.isString() || !right.isString()) {
-                conversion("拼接时把非字符串值隐式转换为字符串", -1);
+    private CscValue add(CscValue left, CscValue right) {
+        if (left.type() == CscType.STRING || right.type() == CscType.STRING) {
+            String l = asText(left, "+");
+            String r = asText(right, "+");
+            return CscValue.ofString(l + r);
+        }
+        return numeric("+", left, right);
+    }
+
+    private CscValue subtract(CscValue left, CscValue right) {
+        return numeric("-", left, right);
+    }
+
+    private CscValue multiply(CscValue left, CscValue right) {
+        return numeric("*", left, right);
+    }
+
+    private CscValue divide(CscValue left, CscValue right) {
+        if (Conversions.useFloat(left, right)) {
+            double divisor = Conversions.asFloat(right, ctx, absolute(), "/");
+            if (divisor == 0.0D) {
+                throw new CscRuntimeException("除零");
             }
-            return Value.string(left.asText() + right.asText());
+            return CscValue.ofFloat(Conversions.asFloat(left, ctx, absolute(), "/") / divisor);
         }
-        return Value.number(asNumber(left, "+") + asNumber(right, "+"));
+        long divisor = Conversions.asInt(right, ctx, absolute(), "/");
+        if (divisor == 0L) {
+            throw new CscRuntimeException("除零");
+        }
+        return CscValue.ofInt(Conversions.asInt(left, ctx, absolute(), "/") / divisor);
     }
 
-    private Value divide(Value left, Value right) {
-        double divisor = asNumber(right, "/");
-        if (divisor == 0.0D) {
-            throw new EvaluationException("除零");
+    private CscValue modulo(CscValue left, CscValue right) {
+        if (Conversions.useFloat(left, right)) {
+            double divisor = Conversions.asFloat(right, ctx, absolute(), "%mod");
+            if (divisor == 0.0D) {
+                throw new CscRuntimeException("%mod 除零");
+            }
+            return CscValue.ofFloat(Conversions.asFloat(left, ctx, absolute(), "%mod") % divisor);
         }
-        return Value.number(asNumber(left, "/") / divisor);
+        long divisor = Conversions.asInt(right, ctx, absolute(), "%mod");
+        if (divisor == 0L) {
+            throw new CscRuntimeException("%mod 除零");
+        }
+        return CscValue.ofInt(Conversions.asInt(left, ctx, absolute(), "%mod") % divisor);
     }
 
-    private Value remainder(Value left, Value right) {
-        double divisor = asNumber(right, "/@");
-        if (divisor == 0.0D) {
-            throw new EvaluationException("取余时除零");
+    private CscValue numeric(String op, CscValue left, CscValue right) {
+        if (Conversions.useFloat(left, right)) {
+            double l = Conversions.asFloat(left, ctx, absolute(), op);
+            double r = Conversions.asFloat(right, ctx, absolute(), op);
+            return CscValue.ofFloat(switch (op) {
+                case "+" -> l + r;
+                case "-" -> l - r;
+                default -> l * r;
+            });
         }
-        return Value.number(asNumber(left, "/@") % divisor);
+        long l = Conversions.asInt(left, ctx, absolute(), op);
+        long r = Conversions.asInt(right, ctx, absolute(), op);
+        return CscValue.ofInt(switch (op) {
+            case "+" -> l + r;
+            case "-" -> l - r;
+            default -> l * r;
+        });
     }
 
-    private double asNumber(Value value, String operator) {
-        switch (value.kind()) {
-            case NUMBER:
-                return value.numberValue();
-            case BOOLEAN:
-                conversion("布尔值在 " + operator + " 中按数值处理", -1);
-                return value.booleanValue() ? 1.0D : 0.0D;
-            case STRING:
-            default:
-                String text = value.stringValue().trim();
-                try {
-                    double parsed = Double.parseDouble(text);
-                    conversion("字符串 \"" + text + "\" 在 " + operator + " 中被解析为数值", -1);
-                    return parsed;
-                } catch (NumberFormatException e) {
-                    throw new EvaluationException("无法把 \"" + value.stringValue() + "\" 当作数值参与 " + operator);
-                }
+    private String asText(CscValue value, String op) {
+        if (value.type() == CscType.STRING) {
+            return value.asString();
         }
+        return Conversions.to(CscType.STRING, value, ctx, absolute(), "拼接 " + op).asString();
     }
 
-    private boolean asBoolean(Value value, String operator) {
-        switch (value.kind()) {
-            case BOOLEAN:
-                return value.booleanValue();
-            case NUMBER:
-                conversion("数值在 " + operator + " 中按布尔处理", -1);
-                return value.numberValue() != 0.0D;
-            case STRING:
-            default:
-                String text = value.stringValue().trim();
-                if ("true".equalsIgnoreCase(text)) {
-                    conversion("字符串 \"" + text + "\" 在 " + operator + " 中被解析为布尔", -1);
-                    return true;
-                }
-                if ("false".equalsIgnoreCase(text)) {
-                    conversion("字符串 \"" + text + "\" 在 " + operator + " 中被解析为布尔", -1);
-                    return false;
-                }
-                throw new EvaluationException("无法把 \"" + value.stringValue() + "\" 当作布尔参与 " + operator);
+    private boolean valuesEqual(CscValue left, CscValue right) {
+        boolean leftNumberish = isNumberish(left);
+        boolean rightNumberish = isNumberish(right);
+        if (leftNumberish && rightNumberish) {
+            return Conversions.useFloat(left, right)
+                    ? Conversions.asFloat(left, ctx, absolute(), "==") == Conversions.asFloat(right, ctx, absolute(), "==")
+                    : Conversions.asInt(left, ctx, absolute(), "==") == Conversions.asInt(right, ctx, absolute(), "==");
+        }
+        if (left.type() == CscType.BOOL && right.type() == CscType.BOOL) {
+            return left.asBool() == right.asBool();
+        }
+        if (left.type() == CscType.STRING || right.type() == CscType.STRING) {
+            return asText(left, "==").equals(asText(right, "=="));
+        }
+        throw new CscRuntimeException("无法比较 " + left.type().keyword() + " 和 " + right.type().keyword());
+    }
+
+    private int compare(CscValue left, CscValue right) {
+        if (isNumberish(left) && isNumberish(right)) {
+            if (Conversions.useFloat(left, right)) {
+                return Double.compare(Conversions.asFloat(left, ctx, absolute(), "比较"),
+                        Conversions.asFloat(right, ctx, absolute(), "比较"));
+            }
+            return Long.compare(Conversions.asInt(left, ctx, absolute(), "比较"),
+                    Conversions.asInt(right, ctx, absolute(), "比较"));
+        }
+        if (left.type() == CscType.STRING || right.type() == CscType.STRING) {
+            return asText(left, "比较").compareTo(asText(right, "比较"));
+        }
+        throw new CscRuntimeException("无法比较 " + left.type().keyword() + " 和 " + right.type().keyword());
+    }
+
+    private boolean isNumberish(CscValue value) {
+        if (value.type() == CscType.INT || value.type() == CscType.FLOAT || value.type() == CscType.BOOL) {
+            return true;
+        }
+        if (value.type() != CscType.STRING) {
+            return false;
+        }
+        try {
+            Double.parseDouble(value.asString().trim());
+            return true;
+        } catch (NumberFormatException e) {
+            return false;
         }
     }
 
     // ---------------------------------------------------------------- 工具
 
-    private void conversion(String message, int localPosition) {
-        diagnostics.add(Diagnostic.conversion(message, baseOffset + (localPosition < 0 ? pos : localPosition)));
-    }
-
-    private EvaluationException error(String message) {
-        return new EvaluationException(message + "（偏移 " + (baseOffset + pos) + "）");
+    /** 在运算符位置识别 {@code %mod}；{@code %mod%} 是变量，不在此列。 */
+    private boolean tryModKeyword() {
+        if (!src.startsWith("%mod", pos)) {
+            return false;
+        }
+        int after = pos + 4;
+        if (after < src.length() && src.charAt(after) == '%') {
+            return false;
+        }
+        pos = after;
+        return true;
     }
 
     private void skipWhitespace() {
@@ -362,15 +526,20 @@ public final class ExpressionParser {
         }
     }
 
-    private boolean peek(String token) {
-        return src.startsWith(token, pos);
-    }
-
     private boolean consume(String token) {
         if (src.startsWith(token, pos)) {
             pos += token.length();
             return true;
         }
         return false;
+    }
+
+    private int absolute() {
+        return baseOffset + pos;
+    }
+
+    /** 供宿主把分类诊断附到正确位置。 */
+    public void reportConversion(String message) {
+        ctx.report(CscDiagnostic.conversion(message, absolute()));
     }
 }

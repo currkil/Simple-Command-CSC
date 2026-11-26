@@ -4,7 +4,7 @@ plugins {
 }
 
 // CSC 是纯 JDK 库：不依赖 Minecraft、不依赖任何加载器。
-// 这样 Core 可以直接 JiJ 内嵌，将来 Paper / 脚本终端也能复用同一份实现。
+// 构建产物由 Core 通过 jarJar 内嵌，将来 Paper / 脚本终端也能复用同一份实现。
 group = csc_group_id
 version = csc_version
 
@@ -31,7 +31,9 @@ jar {
     }
 }
 
-// 语言层冒烟测试：tools/ 下的纯 JDK 测试程序，不引入测试框架。
+// ============================================================
+// 冒烟测试（纯 JDK，不引入测试框架）
+// ============================================================
 sourceSets {
     smoke {
         java.srcDir 'tools'
@@ -56,11 +58,17 @@ tasks.named('check') {
     dependsOn 'smokeTest'
 }
 
+// ============================================================
+// 发布
+// ============================================================
 def repoToken = project.findProperty("reposiliteToken") ?: ""
 publishing {
     publications {
         mavenJava(MavenPublication) {
             from components.java
+            // 坐标固定为 sc_csc：Core 侧依赖 cd.cc.currkill:sc_csc:<version>，
+            // 不能跟着工程名 simple-command-csc 变。
+            artifactId = 'sc_csc'
         }
     }
     repositories {
@@ -73,4 +81,22 @@ publishing {
             allowInsecureProtocol = true
         }
     }
+}
+
+// ============================================================
+// 部署：把产物复制到统一的 jars 目录
+// ============================================================
+tasks.register('releaseJar', Copy) {
+    dependsOn 'jar'
+    from layout.buildDirectory.dir("libs")
+    include "sc_csc-*.jar"
+    exclude "*-sources.jar", "*-javadoc.jar"
+    into "E:\\workspace\\minecraft_mod\\Simple Command\\jars\\csc"
+    rename { String fileName ->
+        "sc_${sc_name}-${project.version}.jar"
+    }
+}
+
+tasks.named('build') {
+    finalizedBy 'releaseJar'
 }

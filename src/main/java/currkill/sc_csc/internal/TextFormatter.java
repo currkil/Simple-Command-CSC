@@ -1,75 +1,57 @@
 package currkill.sc_csc.internal;
 
-import currkill.sc_csc.api.Diagnostic;
-import currkill.sc_csc.api.EvaluationException;
-import currkill.sc_csc.api.FormatResult;
-import currkill.sc_csc.api.VariableProvider;
-
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Optional;
+import currkill.sc_csc.api.CscContext;
+import currkill.sc_csc.api.CscDiagnostic;
+import currkill.sc_csc.api.CscRuntimeException;
+import currkill.sc_csc.api.CscValue;
 
 /**
- * 文本格式化器：把原始文本扫成「字面量 / 转义 / 注释 / 变量 / 表达式」的序列并输出结果。
+ * 文本模式：把一段带转义、注释、变量、表达式的文本展开成字符串。
  *
- * <p>容错粒度是「片段」：出错的片段原样保留在输出里，其他片段正常处理，同时记录诊断。
+ * <p>容错粒度是片段：出错的片段原样保留，其余片段正常输出，同时把诊断交回宿主。
  */
 public final class TextFormatter {
 
     private final String src;
-    private final VariableProvider vars;
-    private final List<Diagnostic> diagnostics = new ArrayList<>();
+    private final CscContext ctx;
     private final StringBuilder out = new StringBuilder();
     private int pos;
 
-    private TextFormatter(String src, VariableProvider vars) {
-        this.src = src;
-        this.vars = vars == null ? VariableProvider.empty() : vars;
+    public TextFormatter(String src, CscContext ctx) {
+        this.src = src == null ? "" : src;
+        this.ctx = ctx;
     }
 
-    public static FormatResult format(String raw, VariableProvider vars) {
-        if (raw == null || raw.isEmpty()) {
-            return FormatResult.of("", List.of());
+    public static String format(String src, CscContext ctx) {
+        if (src == null || src.isEmpty()) {
+            return "";
         }
-        TextFormatter formatter = new TextFormatter(raw, vars);
+        TextFormatter formatter = new TextFormatter(src, ctx);
         formatter.scan();
-        return FormatResult.of(formatter.out.toString(), formatter.diagnostics);
+        return formatter.out.toString();
     }
 
     private void scan() {
         int length = src.length();
         while (pos < length) {
             char c = src.charAt(pos);
-            switch (c) {
-                case '\\' -> comment();
-                case '/' -> slash();
-                case '%' -> variable();
-                default -> {
-                    out.append(c);
-                    pos++;
-                }
+            if (c == '\\') {
+                escape();
+            } else if (c == '/' && pos + 1 < length && (src.charAt(pos + 1) == '/' || src.charAt(pos + 1) == '*')) {
+                comment();
+            } else if (c == '%') {
+                variable();
+            } else {
+                out.append(c);
+                pos++;
             }
         }
     }
 
-    /** 注释：\...\ ，不嵌套，不输出。未闭合时整段原样保留并报严重错误。 */
-    private void comment() {
-        int close = src.indexOf('\\', pos + 1);
-        if (close < 0) {
-            diagnostics.add(Diagnostic.severe("未闭合的注释，缺少结尾 \\", pos));
-            out.append(src, pos, src.length());
-            pos = src.length();
-            return;
-        }
-        pos = close + 1;
-    }
-
-    /** 转义：/ 打头的两字符序列；/!( 表示表达式开始。 */
-    private void slash() {
+    private void escape() {
         int length = src.length();
         if (pos + 1 >= length) {
-            diagnostics.add(Diagnostic.severe("转义符 / 后面没有字符", pos));
-            out.append('/');
+            out.append('\\');
             pos++;
             return;
         }
@@ -79,49 +61,64 @@ public final class TextFormatter {
             return;
         }
         switch (next) {
-            case '/' -> out.append('/');
+            case '\\' -> out.append('\\');
             case 'n' -> out.append('\n');
             case 't' -> out.append('\t');
             case 'r' -> out.append('\r');
             case '%' -> out.append('%');
             case '!' -> out.append('!');
-            case '\\' -> out.append('\\');
             default -> {
-                diagnostics.add(Diagnostic.severe("未知的转义序列 /" + next, pos));
-                out.append('/').append(next);
+                // 规范：\ 后跟非转义字符时，\ 与后一个字符都按字面输出
+                out.append('\\').append(next);
             }
         }
         pos += 2;
     }
 
-    /** 变量：%name% ，内部整体是变量名。未知变量报严重错误并原样保留。 */
-    private void variable() {
+    private void comment() {
         int length = src.length();
-        int close = src.indexOf('%', pos + 1);
-        if (close < 0) {
-            diagnostics.add(Diagnostic.severe("变量缺少结尾 %", pos));
+        char kind = src.charAt(pos + 1);
+        if (kind == '/') {
+            int end = src.indexOf('\n', pos + 2);
+            pos = end < 0 ? length : end;
+            return;
+        }
+        int end = src.indexOf("*/", pos + 2);
+        if (end < 0) {
+            ctx.report(CscDiagnostic.severe("未闭合的块注释 /*", pos));
             out.append(src, pos, length);
             pos = length;
             return;
         }
-        String name = src.substring(pos + 1, close);
+        pos = end + 2;
+    }
+
+    private void variable() {
+        int length = src.length();
+        int close = src.indexOf('%', pos + 1);
+        if (close < 0) {
+            // 规范：未闭合 % 按普通字符输出
+            out.append('%');
+            pos++;
+            return;
+        }
+        String name = src.substring(pos + 1, close).trim();
         if (name.isEmpty()) {
-            diagnostics.add(Diagnostic.severe("变量名为空", pos));
             out.append("%%");
             pos = close + 1;
             return;
         }
-        Optional<String> value = vars.get(name);
-        if (value.isPresent()) {
-            out.append(value.get());
-        } else {
-            diagnostics.add(Diagnostic.severe("未知变量 %" + name + "%", pos));
-            out.append('%').append(name).append('%');
+        if (!ctx.hasVariable(name)) {
+            ctx.report(CscDiagnostic.severe("未知变量 %" + name + "%", pos));
+            out.append('%').append(src, pos + 1, close).append('%');
+            pos = close + 1;
+            return;
         }
+        CscValue value = ctx.getVariable(name);
+        out.append(value == null ? "" : value.asString());
         pos = close + 1;
     }
 
-    /** 表达式：/!( ... ) ，求出结果后输出结果文本；出错时整段原样保留。 */
     private void expression() {
         int start = pos;
         int bodyStart = pos + 3;
@@ -131,7 +128,7 @@ public final class TextFormatter {
         int closing = -1;
         while (i < length) {
             char c = src.charAt(i);
-            if (c == '\'') {
+            if (c == '"') {
                 i++;
                 while (i < length) {
                     char inner = src.charAt(i);
@@ -139,7 +136,7 @@ public final class TextFormatter {
                         i += 2;
                         continue;
                     }
-                    if (inner == '\'') {
+                    if (inner == '"') {
                         i++;
                         break;
                     }
@@ -171,17 +168,16 @@ public final class TextFormatter {
             i++;
         }
         if (closing < 0) {
-            diagnostics.add(Diagnostic.severe("未闭合的表达式，缺少右括号 )", start));
+            ctx.report(CscDiagnostic.severe("未闭合的表达式 \\!(，缺少右括号 )", start));
             out.append(src, start, length);
             pos = length;
             return;
         }
         String body = src.substring(bodyStart, closing);
         try {
-            Value value = new ExpressionParser(body, vars, diagnostics, bodyStart).parse();
-            out.append(value.asText());
-        } catch (EvaluationException e) {
-            diagnostics.add(Diagnostic.severe(e.getMessage(), start));
+            out.append(ExpressionParser.parseFull(body, ctx, bodyStart).asString());
+        } catch (CscRuntimeException e) {
+            ctx.report(CscDiagnostic.severe(e.getMessage(), start));
             out.append(src, start, closing + 1);
         }
         pos = closing + 1;
